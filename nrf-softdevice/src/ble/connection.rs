@@ -188,6 +188,12 @@ pub(crate) struct EncryptionState {
     pub own_enc_key: raw::ble_gap_enc_key_t,
     pub peer_enc_key: raw::ble_gap_enc_key_t,
     pub peer_id: raw::ble_gap_id_key_t,
+
+    // LE Secure Connections public keys. The softdevice keeps pointers to these for the
+    // duration of the pairing procedure, so they must live in the connection state.
+    pub lesc: bool,
+    pub own_pk: raw::ble_gap_lesc_p256_pk_t,
+    pub peer_pk: raw::ble_gap_lesc_p256_pk_t,
 }
 
 #[cfg(feature = "ble-sec")]
@@ -214,6 +220,9 @@ const NEW_ENCRYPTION_STATE: EncryptionState = EncryptionState {
     own_enc_key: NEW_GAP_ENC_KEY,
     peer_enc_key: NEW_GAP_ENC_KEY,
     peer_id: NEW_GAP_ID_KEY,
+    lesc: false,
+    own_pk: raw::ble_gap_lesc_p256_pk_t { pk: [0; 64] },
+    peer_pk: raw::ble_gap_lesc_p256_pk_t { pk: [0; 64] },
 };
 
 // We could make the public Connection type simply hold the softdevice's conn_handle.
@@ -354,6 +363,8 @@ impl ConnectionState {
         trace!("conn {:?}: disconnected", _index);
     }
 
+    /// Builds the keyset for `sd_ble_gap_sec_params_reply`. The public key pointers are only
+    /// set if `security.lesc` is set, in which case `security.own_pk` must hold the local key.
     pub(crate) fn keyset(&mut self) -> raw::ble_gap_sec_keyset_t {
         #[cfg(feature = "ble-sec")]
         return raw::ble_gap_sec_keyset_t {
@@ -361,13 +372,21 @@ impl ConnectionState {
                 p_enc_key: &mut self.security.own_enc_key,
                 p_id_key: core::ptr::null_mut(),
                 p_sign_key: core::ptr::null_mut(),
-                p_pk: core::ptr::null_mut(),
+                p_pk: if self.security.lesc {
+                    &mut self.security.own_pk
+                } else {
+                    core::ptr::null_mut()
+                },
             },
             keys_peer: raw::ble_gap_sec_keys_t {
                 p_enc_key: &mut self.security.peer_enc_key,
                 p_id_key: &mut self.security.peer_id,
                 p_sign_key: core::ptr::null_mut(),
-                p_pk: core::ptr::null_mut(),
+                p_pk: if self.security.lesc {
+                    &mut self.security.peer_pk
+                } else {
+                    core::ptr::null_mut()
+                },
             },
         };
         #[cfg(not(feature = "ble-sec"))]
@@ -741,6 +760,7 @@ impl Connection {
                     let mut p: raw::ble_gap_sec_params_t = unsafe { core::mem::zeroed() };
                     p.set_bond(h.can_bond(self) as u8);
                     p.set_mitm(h.request_mitm_protection(self) as u8);
+                    p.set_lesc(h.lesc_public_key(self).is_some() as u8);
                     p
                 })
                 .unwrap_or_else(|| unsafe { core::mem::zeroed() });
@@ -766,7 +786,12 @@ impl Connection {
                 .security
                 .handler
                 .ok_or(EncryptError::NoSecurityHandler)
-                .and_then(|handler| handler.get_peripheral_key(self).ok_or(EncryptError::PeerKeysNotFound))
+                .and_then(|handler| {
+                    handler
+                        .get_peripheral_key(self)
+                        .filter(|(_, ltk)| ltk.as_raw().lesc() != 0 || !handler.require_lesc(self))
+                        .ok_or(EncryptError::PeerKeysNotFound)
+                })
                 .map(|keys| (conn_handle, keys))
         })?;
 

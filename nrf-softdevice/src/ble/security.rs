@@ -4,6 +4,12 @@ use crate::ble::types::{EncryptionInfo, IdentityKey, MasterId, SecurityMode};
 use crate::ble::Connection;
 use crate::raw;
 
+/// LE Secure Connections P-256 public key: X followed by Y, both little-endian.
+pub type LescPublicKey = [u8; 64];
+
+/// LE Secure Connections Diffie-Hellman shared secret, little-endian.
+pub type LescDhKey = [u8; 32];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum IoCapabilities {
@@ -68,6 +74,34 @@ pub trait SecurityHandler {
         panic!("SecurityHandler::recv_out_of_band is not implemented");
     }
 
+    /// Return the local P-256 public key to enable LE Secure Connections pairing.
+    ///
+    /// The key is copied into the connection when pairing starts, so the key pair may be
+    /// regenerated at any time without affecting a pairing procedure already in progress.
+    ///
+    /// Must be implemented together with [`lesc_dhkey()`][Self::lesc_dhkey].
+    fn lesc_public_key(&self, _conn: &Connection) -> Option<LescPublicKey> {
+        None
+    }
+
+    /// Compute the LE Secure Connections Diffie-Hellman shared secret: the X coordinate of
+    /// the local private key multiplied by `peer_public_key`.
+    ///
+    /// Implementations must check that `peer_public_key` is a point on the P-256 curve and
+    /// return `None` if it isn't (CVE-2018-5383). Returning `None` disconnects the peer.
+    fn lesc_dhkey(&self, _conn: &Connection, _peer_public_key: &LescPublicKey) -> Option<LescDhKey> {
+        None
+    }
+
+    /// Return `true` to refuse legacy pairing for `conn`.
+    ///
+    /// Pairing with a peer that doesn't support LE Secure Connections is rejected, and keys
+    /// from a legacy bond returned by [`get_key()`][Self::get_key] or
+    /// `get_peripheral_key()` are not used to encrypt the link.
+    fn require_lesc(&self, _conn: &Connection) -> bool {
+        false
+    }
+
     /// Called when the [`SecurityMode`] of a [`Connection`] has changed.
     fn on_security_update(&self, _conn: &Connection, _security_mode: SecurityMode) {}
 
@@ -116,6 +150,7 @@ pub trait SecurityHandler {
         sec_params.set_oob(self.can_recv_out_of_band(conn) as u8);
         sec_params.set_io_caps(self.io_capabilities().to_raw());
         sec_params.set_mitm(self.request_mitm_protection(conn) as u8);
+        sec_params.set_lesc(self.lesc_public_key(conn).is_some() as u8);
 
         if self.can_bond(conn) {
             sec_params.set_bond(1);

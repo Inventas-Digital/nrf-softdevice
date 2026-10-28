@@ -172,7 +172,14 @@ pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
                     peer_params.min_key_size, peer_params.max_key_size);
 
             if let Some(conn) = Connection::from_handle(gap_evt.conn_handle) {
-                let (sec_params, keyset) = conn.with_state(|state| {
+                let reply = conn.with_state(|state| {
+                    #[cfg(feature = "ble-sec")]
+                    {
+                        let own_pk = state.security.handler.and_then(|h| h.lesc_public_key(&conn));
+                        state.security.lesc = own_pk.is_some();
+                        state.security.own_pk.pk = own_pk.unwrap_or([0; 64]);
+                    }
+
                     #[cfg(not(feature = "ble-peripheral"))]
                     let sec_params = None;
                     #[cfg(feature = "ble-peripheral")]
@@ -185,20 +192,49 @@ pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
                             .handler
                             .map(|h| h.security_params(&conn))
                             .unwrap_or_else(default_security_params);
+
+                        // In the central role the peer's parameters aren't known yet, so
+                        // legacy pairing is caught in BLE_GAP_EVT_AUTH_STATUS instead.
+                        #[cfg(feature = "ble-sec")]
+                        if peer_params.lesc() == 0 && state.security.handler.is_some_and(|h| h.require_lesc(&conn)) {
+                            return None;
+                        }
+
                         Some(sec_params)
                     } else {
                         None
                     };
 
-                    (sec_params, state.keyset())
+                    #[allow(unused_mut)]
+                    let mut keyset = state.keyset();
+
+                    // The LTK isn't distributed with LE Secure Connections, and the softdevice
+                    // requires the peer's encryption key pointer to be NULL then.
+                    #[cfg(all(feature = "ble-peripheral", feature = "ble-sec"))]
+                    if state.role == Role::Peripheral && state.security.lesc && peer_params.lesc() != 0 {
+                        keyset.keys_peer.p_enc_key = core::ptr::null_mut();
+                    }
+
+                    Some((sec_params, keyset))
                 });
 
-                let ret = raw::sd_ble_gap_sec_params_reply(
-                    gap_evt.conn_handle,
-                    raw::BLE_GAP_SEC_STATUS_SUCCESS as u8,
-                    sec_params.as_ref().map(|x| x as *const _).unwrap_or(core::ptr::null()),
-                    &keyset,
-                );
+                let ret = match reply {
+                    Some((sec_params, keyset)) => raw::sd_ble_gap_sec_params_reply(
+                        gap_evt.conn_handle,
+                        raw::BLE_GAP_SEC_STATUS_SUCCESS as u8,
+                        sec_params.as_ref().map(|x| x as *const _).unwrap_or(core::ptr::null()),
+                        &keyset,
+                    ),
+                    None => {
+                        warn!("Rejecting pairing: peer doesn't support LE Secure Connections");
+                        raw::sd_ble_gap_sec_params_reply(
+                            gap_evt.conn_handle,
+                            raw::BLE_GAP_SEC_STATUS_PAIRING_NOT_SUPP as u8,
+                            core::ptr::null(),
+                            core::ptr::null(),
+                        )
+                    }
+                };
 
                 if let Err(_err) = RawError::convert(ret) {
                     warn!("sd_ble_gap_sec_params_reply err {:?}", _err);
@@ -263,8 +299,10 @@ pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
 
             #[cfg(feature = "ble-sec")]
             let key = Connection::from_handle(gap_evt.conn_handle).and_then(|conn| {
-                conn.security_handler()
-                    .and_then(|x| x.get_key(&conn, MasterId::from_raw(params.master_id)))
+                conn.security_handler().and_then(|x| {
+                    x.get_key(&conn, MasterId::from_raw(params.master_id))
+                        .filter(|key| key.as_raw().lesc() != 0 || !x.require_lesc(&conn))
+                })
             });
 
             #[cfg(not(feature = "ble-sec"))]
@@ -311,10 +349,20 @@ pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
                 params.kdist_peer._bitfield_1.get(0, 8)
             );
             #[cfg(feature = "ble-sec")]
-            if u32::from(params.auth_status) == raw::BLE_GAP_SEC_STATUS_SUCCESS && params.bonded() != 0 {
+            if u32::from(params.auth_status) == raw::BLE_GAP_SEC_STATUS_SUCCESS {
                 if let Some(conn) = Connection::from_handle(gap_evt.conn_handle) {
                     conn.with_state(|state| {
                         if let Some(handler) = state.security.handler {
+                            if params.lesc() == 0 && handler.require_lesc(&conn) {
+                                warn!("Disconnecting: pairing completed without LE Secure Connections");
+                                let _ = state.disconnect();
+                                return;
+                            }
+
+                            if params.bonded() == 0 {
+                                return;
+                            }
+
                             let peer_id = if params.kdist_peer.id() != 0 {
                                 IdentityKey::from_raw(state.security.peer_id)
                             } else {
@@ -322,7 +370,11 @@ pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
                                 IdentityKey::from_addr(state.peer_address)
                             };
 
+                            // With LE Secure Connections both sides derive the LTK themselves
+                            // instead of distributing it, so it's in the own keys for both roles.
                             let enc_key = match state.role {
+                                #[cfg(feature = "ble-central")]
+                                Role::Central if params.lesc() != 0 => &state.security.own_enc_key,
                                 #[cfg(feature = "ble-central")]
                                 Role::Central => &state.security.peer_enc_key,
                                 #[cfg(feature = "ble-peripheral")]
@@ -367,8 +419,38 @@ pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
                 }
             }
         }
+        #[cfg(feature = "ble-sec")]
+        raw::BLE_GAP_EVTS_BLE_GAP_EVT_LESC_DHKEY_REQUEST => {
+            let params = &gap_evt.params.lesc_dhkey_request;
+            trace!("ble evt lesc dhkey request conn={:x}", gap_evt.conn_handle);
+
+            if let Some(conn) = Connection::from_handle(gap_evt.conn_handle) {
+                let dhkey = conn
+                    .security_handler()
+                    .and_then(|h| h.lesc_dhkey(&conn, &(*params.p_pk_peer).pk));
+
+                let ret = match dhkey {
+                    Some(key) => {
+                        raw::sd_ble_gap_lesc_dhkey_reply(gap_evt.conn_handle, &raw::ble_gap_lesc_dhkey_t { key })
+                    }
+                    // Never answer with a predictable DHKey: with an invalid peer key that
+                    // would let the peer complete pairing with a key it can compute.
+                    None => {
+                        warn!("LESC DHKey not available; disconnecting");
+                        let _ = conn.disconnect();
+                        raw::NRF_SUCCESS
+                    }
+                };
+
+                if let Err(_err) = RawError::convert(ret) {
+                    warn!("sd_ble_gap_lesc_dhkey_reply err {:?}", _err);
+                    let _ = conn.disconnect();
+                }
+            } else {
+                warn!("Received LESC_DHKEY_REQUEST with an invalid connection handle");
+            }
+        }
         // BLE_GAP_EVTS_BLE_GAP_EVT_KEY_PRESSED (LESC central pairing)
-        // BLE_GAP_EVTS_BLE_GAP_EVT_LESC_DHKEY_REQUEST (LESC key calculation)
         // BLE_GAP_EVTS_BLE_GAP_EVT_RSSI_CHANGED
         // BLE_GAP_EVTS_BLE_GAP_EVT_SCAN_REQ_REPORT
         // BLE_GAP_EVTS_BLE_GAP_EVT_QOS_CHANNEL_SURVEY_REPORT
