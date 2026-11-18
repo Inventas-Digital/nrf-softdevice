@@ -196,7 +196,14 @@ pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
                         // In the central role the peer's parameters aren't known yet, so
                         // legacy pairing is caught in BLE_GAP_EVT_AUTH_STATUS instead.
                         #[cfg(feature = "ble-sec")]
+                        if state.security.handler.is_some_and(|h| !h.allow_pairing(&conn)) {
+                            warn!("Rejecting pairing: not allowed by security handler");
+                            return None;
+                        }
+
+                        #[cfg(feature = "ble-sec")]
                         if peer_params.lesc() == 0 && state.security.handler.is_some_and(|h| h.require_lesc(&conn)) {
+                            warn!("Rejecting pairing: peer doesn't support LE Secure Connections");
                             return None;
                         }
 
@@ -226,7 +233,6 @@ pub(crate) unsafe fn on_evt(ble_evt: *const raw::ble_evt_t) {
                         &keyset,
                     ),
                     None => {
-                        warn!("Rejecting pairing: peer doesn't support LE Secure Connections");
                         raw::sd_ble_gap_sec_params_reply(
                             gap_evt.conn_handle,
                             raw::BLE_GAP_SEC_STATUS_PAIRING_NOT_SUPP as u8,

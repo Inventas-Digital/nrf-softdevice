@@ -102,6 +102,14 @@ pub trait SecurityHandler {
         false
     }
 
+    /// Return `false` to reject pairing requests from `conn`.
+    ///
+    /// Only applies in the peripheral role. Encrypting the link with keys returned by
+    /// [`get_key()`][Self::get_key] is not affected.
+    fn allow_pairing(&self, _conn: &Connection) -> bool {
+        true
+    }
+
     /// Called when the [`SecurityMode`] of a [`Connection`] has changed.
     fn on_security_update(&self, _conn: &Connection, _security_mode: SecurityMode) {}
 
